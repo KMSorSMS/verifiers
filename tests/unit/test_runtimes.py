@@ -48,6 +48,7 @@ from verifiers.v1.runtimes import (
     make_backend,
     provision_runtime,
 )
+from verifiers.v1.runtimes.backends import docker
 from verifiers.v1.runtimes.backends.subprocess import signal_process
 from verifiers.v1.runtimes.compose import ComposeSpec, compose_services
 from verifiers.v1.runtimes.strategies import _deployment_strategy
@@ -182,6 +183,66 @@ async def test_run(runtime) -> None:
         assert stdin.exit_code == 0 and stdin.stdout == "", "run must close stdin"
 
 
+@pytest.mark.parametrize("gpu", [None, "1"])
+async def test_docker_respects_the_resolved_gpu_request_over_image_and_task_env(
+    monkeypatch, gpu
+):
+    """A CPU sandbox stays CPU-only even with an NVIDIA default daemon/image;
+    an explicit task GPU request still reaches Docker's device allocation."""
+    command = []
+
+    class LaunchObserved(Exception):
+        pass
+
+    async def cli(*argv, **kwargs):
+        if argv[:2] == ("docker", "run"):
+            command.extend(argv)
+            raise LaunchObserved
+        return vf.ProgramResult(0, "", "")
+
+    config = resolve_runtime_config(vf.DockerConfig(), task(resources={"gpu": gpu}))
+    backend = docker.DockerBackend(config)
+    backend.env = {"NVIDIA_VISIBLE_DEVICES": "all", "TASK_SETTING": "keep"}
+    monkeypatch.setattr(docker, "cli", cli)
+    with pytest.raises(LaunchObserved):
+        await backend.start()
+    environment = dict(
+        command[i + 1].split("=", 1) for i, arg in enumerate(command) if arg == "--env"
+    )
+    assert environment == {
+        "NVIDIA_VISIBLE_DEVICES": "all" if gpu else "void",
+        "TASK_SETTING": "keep",
+    }
+    assert ("--gpus" in command) is bool(gpu)
+    if gpu:
+        assert command[command.index("--gpus") + 1] == "1"
+
+
+@pytest.mark.parametrize("helper", ["listener", "network"])
+async def test_docker_network_helpers_never_request_gpu_access(monkeypatch, helper):
+    command = []
+
+    class LaunchObserved(Exception):
+        pass
+
+    async def cli(*argv, **kwargs):
+        if argv[:2] == ("docker", "run"):
+            command.extend(argv)
+            raise LaunchObserved
+        return vf.ProgramResult(0, "", "")
+
+    backend = docker.DockerBackend(vf.DockerConfig(gpu="1"))
+    backend._container = "owned-test-container"
+    monkeypatch.setattr(docker, "cli", cli)
+    with pytest.raises(LaunchObserved):
+        if helper == "listener":
+            await backend._container_listener()
+        else:
+            await backend._net_admin("true", "test")
+    assert command[command.index("--env") + 1] == "NVIDIA_VISIBLE_DEVICES=void"
+    assert "--gpus" not in command
+
+
 async def test_exec(runtime) -> None:
     async with provisioned(runtime) as view:
         process = await view.exec(
@@ -311,6 +372,17 @@ async def test_compose(runtime, tmp_path) -> None:
             await deployment.start()
         services = deployment.target_backends
         assert set(services) == {"main", "sidecar"}
+        if isinstance(runtime, vf.DockerConfig):
+            for backend in services.values():
+                devices = await backend.bind().run(
+                    [
+                        "sh",
+                        "-c",
+                        'for device in /dev/nvidia*; do [ ! -e "$device" ] || exit 1; done',
+                    ],
+                    {},
+                )
+                assert devices.exit_code == 0, "CPU-only Compose exposed GPU devices"
         resolved = await services["main"].bind().run(["getent", "hosts", "sidecar"], {})
         assert resolved.exit_code == 0, resolved
         sidecar = services["sidecar"].bind()

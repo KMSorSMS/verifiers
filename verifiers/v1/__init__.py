@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     from verifiers.v1.errors import (
         EnvError,
         HarnessError,
+        InferenceCleanupError,
         InterceptionError,
         ProviderError,
         RolloutError,
@@ -261,6 +262,7 @@ _NAME_TO_MODULE = {
     "PrimeVolume": "verifiers.v1.configs.runtime",
     "ProgramResult": "verifiers.v1.runtimes",
     "ProviderError": "verifiers.v1.errors",
+    "InferenceCleanupError": "verifiers.v1.errors",
     "ReferenceJudge": "verifiers.v1.judges",
     "ReferenceJudgeConfig": "verifiers.v1.judges",
     "Request": "verifiers.v1.types",
@@ -450,6 +452,7 @@ __all__ = [  # noqa: RUF022 - grouped by public API area
     "RolloutError",
     "EnvError",
     "ProviderError",
+    "InferenceCleanupError",
     "HarnessError",
     "ToolsetError",
     "SandboxError",

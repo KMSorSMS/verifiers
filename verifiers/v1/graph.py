@@ -201,9 +201,12 @@ class MessageNode(BaseModel):
     routed_experts: SkipJsonSchema[np.ndarray | None] = None
     """This node's slice of the MoE expert-routing array — uint8 `[len(token_ids), layers,
     top_k]`, the expert ids inference selected for exactly this node's tokens. Attributed from
-    the turn's `generate` payload by `_attribute_routed_experts`; `Branch.routed_experts`
+    the turn's `generate` payload by `_attribute_token_array`; `Branch.routed_experts`
     concatenates these along the path into the trainer's router-replay input. Rides the wire as
     a raw-bytes `__nd__` dict; kept off disk by the dump-site `exclude` in prime-rl."""
+    indexer_topk: SkipJsonSchema[np.ndarray | None] = None
+    """Sparse-attention replay indices for this node's tokens, with the engine's
+    integer dtype preserved. Uses the same token alignment as `routed_experts`."""
     sampling_mask: SkipJsonSchema[SamplingMask | None] = None
     """Sampling masks for this node's sampled tokens.
 
@@ -214,6 +217,11 @@ class MessageNode(BaseModel):
     """Engine weight-version spans over this node's sampled tokens (indexes into the
     completion, as vLLM returns them). Assistant nodes only; None when the engine labels
     none."""
+    prefill_weight_versions: list[WeightVersionSpan] | None = None
+    """Weight-version spans over the generating call's complete prompt, measured
+    from its first token, including cached KV. Sampled assistant nodes only."""
+    prompt_tokens: int | None = None
+    """Actual token count of the prompt that produced this sampled node."""
 
     top_logprobs: SkipJsonSchema[TopLogprobs | None] = None
     """Sampler top-k probabilities for sampled tokens; unnormalized over the head."""
@@ -267,12 +275,12 @@ class MessageNode(BaseModel):
             for name, values in streams.items()
         }
 
-    @field_serializer("routed_experts")
+    @field_serializer("routed_experts", "indexer_topk")
     def serialize_ndarray_field(self, arr: np.ndarray | None) -> dict | None:
         """Integer array -> raw-bytes `__nd__` dict so it rides the wire (numpy can't JSON)."""
         return None if arr is None else encode_ndarray(arr)
 
-    @field_validator("routed_experts", mode="before")
+    @field_validator("routed_experts", "indexer_topk", mode="before")
     @classmethod
     def deserialize_ndarray_field(cls, value: Any) -> np.ndarray | None:
         if value is None or isinstance(value, np.ndarray):
@@ -749,7 +757,7 @@ def prepare_turn(
 
 
 def _replace_placeholder_routing_row(
-    trace: Trace, prefix_node_ids: list[int], arr: np.ndarray, off: int
+    trace: Trace, prefix_node_ids: list[int], arr: np.ndarray, off: int, field: str
 ) -> None:
     """Replace the prefix's placeholder routing row with the one this turn's prefill forwarded."""
     if not 1 <= off <= arr.shape[0]:
@@ -765,7 +773,7 @@ def _replace_placeholder_routing_row(
             break
     if node_with_placeholder is None or not node_with_placeholder.sampled:
         return
-    node_rows = node_with_placeholder.routed_experts
+    node_rows = getattr(node_with_placeholder, field)
     if (
         node_rows is None
         or node_rows.shape[0] == 0
@@ -775,19 +783,22 @@ def _replace_placeholder_routing_row(
     # Row `i` of this turn's array is sequence position `start + i`, so the prefix's final position
     # is `arr[off - 1]`. Concatenating widens the node when this turn serialized `uint16`, where an
     # in-place write would truncate.
-    node_with_placeholder.routed_experts = np.concatenate(
-        [node_rows[:-1], arr[off - 1 : off]], axis=0
+    setattr(
+        node_with_placeholder,
+        field,
+        np.concatenate([node_rows[:-1], arr[off - 1 : off]], axis=0),
     )
 
 
-def _attribute_routed_experts(
+def _attribute_token_array(
     trace: Trace,
     prefix_node_ids: list[int],
     new_node_ids: list[int],
     path_len: int,
     payload: Any,
+    field: str,
 ) -> None:
-    """Attach each new node's slice of this turn's MoE expert-routing array. The `generate`
+    """Attach each new node's slice of a turn's token-aligned replay array. The `generate`
     payload's array covers the turn's prompt+completion from `payload["start"]` (0 = from token
     0); the nodes created this turn tile sequence positions `[path_len:]` in creation order, so
     we hand each node `arr[off : off+len(node.token_ids)]` and advance. Reused-prefix nodes keep
@@ -798,23 +809,26 @@ def _attribute_routed_experts(
     if payload is None:
         return
     raw = binascii.a2b_base64(payload["data"])
-    arr = np.frombuffer(raw, dtype=np.dtype(payload.get("dtype", "uint8"))).reshape(
-        payload["shape"]
-    )
+    default_dtype = "uint8" if field == "routed_experts" else "int32"
+    arr = np.frombuffer(
+        raw, dtype=np.dtype(payload.get("dtype", default_dtype))
+    ).reshape(payload["shape"])
     off = path_len - int(payload.get("start", 0) or 0)
-    _replace_placeholder_routing_row(trace, prefix_node_ids, arr, off)
+    _replace_placeholder_routing_row(trace, prefix_node_ids, arr, off, field)
     needed = off + sum(len(trace.nodes[nid].token_ids) for nid in new_node_ids)
     for nid in new_node_ids:
         n = len(trace.nodes[nid].token_ids)
         end = off + n
         if n and 0 <= off and end <= arr.shape[0]:
             # Own only this node's rows; a view would retain the turn's full-context array.
-            trace.nodes[nid].routed_experts = arr[off:end].copy()
+            setattr(trace.nodes[nid], field, arr[off:end].copy())
         elif n and arr.shape[0] and 0 <= off and end == needed == arr.shape[0] + 1:
             # No forward pass follows the turn's final position, so it gets a placeholder: a
             # copy of the previous row, appended to this node's slice of the array.
-            trace.nodes[nid].routed_experts = np.concatenate(
-                [arr[off:], arr[-1:]], axis=0
+            setattr(
+                trace.nodes[nid],
+                field,
+                np.concatenate([arr[off:], arr[-1:]], axis=0),
             )
         off = end
 
@@ -1112,6 +1126,8 @@ def _commit_turn(turn: PendingTurn, response: Response) -> int:
                 tokens.completion_logprobs if tokens else (), dtype=np.float32
             ),
             weight_versions=tokens.weight_versions if tokens else None,
+            prefill_weight_versions=tokens.prefill_weight_versions if tokens else None,
+            prompt_tokens=len(tokens.prompt_ids) if tokens else None,
         )
     )
     assistant_id = len(trace.nodes) - 1
@@ -1121,9 +1137,15 @@ def _commit_turn(turn: PendingTurn, response: Response) -> int:
     # Attribute this turn's expert-routing array onto the nodes created this turn (new input
     # nodes in creation order, then the assistant node), each getting the routing for its tokens.
     # The prefix goes in too, so the position the previous turn could only pad can be corrected.
-    _attribute_routed_experts(
-        trace, prefix, new_node_ids, path_len, tokens.routed_experts if tokens else None
-    )
+    for field in ("routed_experts", "indexer_topk"):
+        _attribute_token_array(
+            trace,
+            prefix,
+            new_node_ids,
+            path_len,
+            getattr(tokens, field) if tokens else None,
+            field,
+        )
 
     # Sampling masks are completion-aligned, so only the sampled node carries them.
     _attribute_sampling_mask(

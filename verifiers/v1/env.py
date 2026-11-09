@@ -22,7 +22,7 @@ from verifiers.v1.configs.agent import (
 )
 from verifiers.v1.configs.env import EnvConfig, default_agent_harness
 from verifiers.v1.episode import EnvInfo, Episode
-from verifiers.v1.errors import EnvError, boundary
+from verifiers.v1.errors import EnvError, boundary, find_inference_cleanup_error
 from verifiers.v1.harness import Harness, HarnessConfig
 from verifiers.v1.interception import (
     Interception,
@@ -279,7 +279,13 @@ class Env(ABC, Generic[ConfigT]):
                             f"{type(self).__name__}.run() ran no agent — every "
                             "episode must carry at least one run"
                         )
-        except Exception as e:  # noqa: BLE001 - episode boundary records every hook failure
+        except (
+            BaseException
+        ) as e:  # lifecycle failures must survive task-group cancellation
+            if cleanup_error := find_inference_cleanup_error(e):
+                raise cleanup_error
+            if not isinstance(e, Exception):
+                raise
             # Only the deadline's expiry: inner TimeoutErrors became EnvError already.
             if isinstance(e, TimeoutError):
                 e = TimeoutError(
@@ -294,7 +300,13 @@ class Env(ABC, Generic[ConfigT]):
             async with asyncio.timeout(self.config.timeout.finalize):
                 async with boundary(EnvError, f"{type(self).__name__}.finalize()"):
                     await self.finalize(task, episode)
-        except Exception as e:  # noqa: BLE001 - episode boundary records every hook failure
+        except (
+            BaseException
+        ) as e:  # lifecycle failures must survive task-group cancellation
+            if cleanup_error := find_inference_cleanup_error(e):
+                raise cleanup_error
+            if not isinstance(e, Exception):
+                raise
             # As above: a TimeoutError here is the deadline's own expiry.
             if isinstance(e, TimeoutError):
                 e = TimeoutError(

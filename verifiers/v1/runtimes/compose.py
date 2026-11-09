@@ -347,6 +347,12 @@ async def compose_services(
             if "workdir" in main:
                 main["working_dir"] = main.pop("workdir")
             overlay = {"services": {spec.workspace: main}}
+            # Local Compose is CPU-only, including services whose image defaults
+            # expose every GPU through a host's NVIDIA container runtime.
+            for name in services:
+                overlay["services"].setdefault(name, {})["environment"] = {
+                    "NVIDIA_VISIBLE_DEVICES": "void"
+                }
             # Port publication belongs to the service that owns main's network.
             publish = overlay["services"].setdefault(owner, {})
             if config.cpu is not None:

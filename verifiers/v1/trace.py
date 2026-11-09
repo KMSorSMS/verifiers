@@ -55,6 +55,7 @@ EXCLUDE_FIELDS: dict = {
     "nodes": {
         "__all__": {
             "routed_experts",
+            "indexer_topk",
             "sampling_mask",
             "top_logprobs",
         }
@@ -497,11 +498,19 @@ class Branch(BaseModel):
 
     @property
     def routed_experts(self) -> np.ndarray | None:
-        """uint8 `[tokens, layers, top_k]` routing; partial data returns None."""
+        """`[tokens, layers, top_k]` expert routing; partial data returns None."""
+        return self._token_array("routed_experts")
+
+    @property
+    def indexer_topk(self) -> np.ndarray | None:
+        """Sparse-attention replay indices aligned to `token_ids`; partial data returns None."""
+        return self._token_array("indexer_topk")
+
+    def _token_array(self, field: str) -> np.ndarray | None:
         nodes = [n for n in self.nodes if len(n.token_ids)]
-        if not nodes or any(n.routed_experts is None for n in nodes):
+        if not nodes or any(getattr(n, field) is None for n in nodes):
             return None
-        merged = np.concatenate([n.routed_experts for n in nodes], axis=0)
+        merged = np.concatenate([getattr(n, field) for n in nodes], axis=0)
         total = sum(len(n.token_ids) for n in nodes)
         return merged if merged.shape[0] == total else None
 

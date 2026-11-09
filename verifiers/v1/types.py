@@ -1,7 +1,7 @@
 import base64
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, NotRequired
 
 import numpy as np
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_serializer
@@ -244,11 +244,20 @@ class Usage(BaseModel):
 
 
 class RoutedExperts(TypedDict):
-    """Base64 uint8 `[tokens, layers, top_k]` routing and its prompt offset."""
+    """Base64 integer `[tokens, layers, top_k]` routing and its prompt offset."""
 
     data: Any
     shape: list[int]
     start: int
+    dtype: NotRequired[str]
+
+
+class IndexerTopK(RoutedExperts):
+    """Packed sparse-attention indices `[tokens, layers, top_k]` and prompt offset.
+
+    The engine's integer dtype is carried alongside the data (typically int32).
+    Like expert routing, the final generated token has no forward-pass row yet.
+    """
 
 
 class WeightVersionSpan(BaseModel):
@@ -366,12 +375,18 @@ class TurnTokens(BaseModel):
     # per token), attributed per node by the turn's `commit` into `MessageNode.routed_experts`,
     # then dropped. None unless the engine ran with `enable_return_routed_experts`.
     routed_experts: RoutedExperts | None = Field(default=None, exclude=True)
+    indexer_topk: IndexerTopK | None = Field(default=None, exclude=True)
+    """Transient sparse-attention replay indices, attributed to graph nodes at commit."""
     # Transient carrier (excluded): per-completion-token sampling masks,
     # attributed to the assistant node by the turn's `commit`, then dropped.
     sampling_mask: SamplingMask | None = Field(default=None, exclude=True)
     # Transient carrier (excluded): the engine's weight-version spans over the completion,
     # attributed to the assistant node by the turn's `commit`, then dropped.
     weight_versions: list[WeightVersionSpan] | None = Field(default=None, exclude=True)
+    prefill_weight_versions: list[WeightVersionSpan] | None = Field(
+        default=None, exclude=True
+    )
+    """Weight-version spans over this call's prompt tokens, including cached KV."""
 
     # Transient carrier (excluded): per-completion-token top-k sampling heads,
     # attributed to the assistant node by the turn's `commit`, then dropped.

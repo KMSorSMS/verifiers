@@ -14,7 +14,7 @@ from itertools import chain
 from typing import Annotated, Literal
 from urllib.parse import urlparse
 
-from pydantic import Field, model_validator
+from pydantic import Field, JsonValue, model_validator
 from pydantic_config import BaseConfig
 from renderers import RendererConfig
 
@@ -78,10 +78,16 @@ class EvalClientConfig(BaseClientConfig):
 
 
 class TrainClientConfig(BaseClientConfig):
-    """Training: a vLLM `/inference/v1/generate` endpoint with client-side tokenization (via
-    `TrainClient`), so responses carry token IDs and logprobs. Needs a running vLLM engine."""
+    """Training with client-side rendering and an engine's native token generation API.
+    Both backends preserve the sampled token IDs and logprobs on the trace."""
 
     type: Literal["train"] = "train"
+    backend: Literal["vllm", "sglang"] = "vllm"
+    """Native generation protocol; independent of the model's renderer/template."""
+    backend_options: dict[str, JsonValue] = Field(default_factory=dict)
+    """Serializable engine options validated by renderers when constructing the client.
+    For SGLang these include the optional LoRA path and replay-array shapes. Ordinary
+    decoding parameters belong in `SamplingConfig`, not here."""
     renderer: RendererConfig | None = None
     """The `renderers.RendererConfig` to use (the same shared type prime-rl configures).
     `None` auto-resolves from the model — which falls back to the default renderer (no

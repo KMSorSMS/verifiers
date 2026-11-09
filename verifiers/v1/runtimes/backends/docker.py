@@ -333,9 +333,16 @@ class DockerBackend(RuntimeBackend):
         gpu_type, gpu_count = parse_gpu(self.config.gpu)
         if gpu_count:
             options += ["--gpus", str(gpu_count)]
+        # Config already includes resolved task resource requests. On hosts whose
+        # default Docker runtime is NVIDIA, an image's VISIBLE_DEVICES=all can
+        # expose GPUs even without --gpus. The resolved no-GPU policy wins over
+        # both image defaults and task environment variables.
+        environment = (
+            self.env if gpu_count else {**self.env, "NVIDIA_VISIBLE_DEVICES": "void"}
+        )
         env_args = [
             arg
-            for key, value in self.env.items()
+            for key, value in environment.items()
             for arg in ("--env", f"{key}={value}")
         ]
         for target, mount in getattr(self.config, "mounts", {}).items():
@@ -493,6 +500,8 @@ class DockerBackend(RuntimeBackend):
                 "--label",
                 f"verifiers.run={run_scope()}",
                 "--rm",
+                "--env",
+                "NVIDIA_VISIBLE_DEVICES=void",
                 "--user",
                 "0",
                 "--network",
@@ -601,6 +610,8 @@ class DockerBackend(RuntimeBackend):
             "--label",
             f"verifiers.run={run_scope()}",
             "--rm",
+            "--env",
+            "NVIDIA_VISIBLE_DEVICES=void",
             "--network",
             f"container:{self._container}",
             "--cap-drop",

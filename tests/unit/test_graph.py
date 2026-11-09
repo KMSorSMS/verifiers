@@ -20,23 +20,37 @@ def _response(message: vf.AssistantMessage) -> vf.Response:
 
 
 def _routed_payload(
-    num_tokens: int, start: int, base: int, layers: int = 2, top_k: int = 1
+    num_tokens: int,
+    start: int,
+    base: int,
+    layers: int = 2,
+    top_k: int = 1,
+    dtype: str = "uint8",
 ):
     """A fake `generate` router-replay sidecar (uint8 `[num_tokens, layers, top_k]`, base64)."""
     arr = (
         np.arange(num_tokens * layers * top_k)
         .reshape(num_tokens, layers, top_k)
-        .astype(np.uint8)
+        .astype(dtype)
         + base
     )
     return {
         "data": base64.b64encode(arr.tobytes()).decode(),
         "shape": list(arr.shape),
         "start": start,
+        "dtype": dtype,
     }
 
 
-def test_routed_experts_attributed_and_aligned_across_turns():
+@pytest.mark.parametrize(
+    "field,dtype",
+    [
+        ("routed_experts", "uint8"),
+        ("routed_experts", "uint16"),
+        ("indexer_topk", "int32"),
+    ],
+)
+def test_routed_experts_attributed_and_aligned_across_turns(field, dtype):
     """Each turn's full routing (start=0) is attributed to the nodes it created; the new turn's
     nodes get this turn's slice and reused nodes keep theirs, so `Branch.routed_experts`
     concatenates back to a `[tokens, layers, top_k]` array aligned 1:1 with `branch.token_ids` —
@@ -57,7 +71,7 @@ def test_routed_experts_attributed_and_aligned_across_turns():
                 prompt_ids=[10, 11, 12],
                 completion_ids=[20, 21],
                 message_spans=[(0, 2)],
-                routed_experts=_routed_payload(5, 0, 0),
+                **{field: _routed_payload(5, 0, 0, dtype=dtype)},
             ),
         )
     )
@@ -75,25 +89,29 @@ def test_routed_experts_attributed_and_aligned_across_turns():
                 prompt_ids=[10, 11, 12, 20, 21, 30, 31],
                 completion_ids=[40, 41],
                 message_spans=[(0, 2), None, (5, 7)],
-                routed_experts=_routed_payload(9, 0, 100),
+                **{field: _routed_payload(9, 0, 100, dtype=dtype)},
             ),
         )
     )
     branch = trace.branches[-1]
-    re = branch.routed_experts
+    re = getattr(branch, field)
     assert re is not None
     assert re.shape[0] == len(branch.token_ids)
+    assert re.dtype == np.dtype(dtype)
 
     restored = type(trace).model_validate(trace.model_dump())
-    re2 = restored.branches[-1].routed_experts
+    re2 = getattr(restored.branches[-1], field)
     assert re2 is not None and re2.shape == re.shape and bool((re2 == re).all())
     assert all(
-        node.routed_experts is None or node.routed_experts.flags.owndata
+        getattr(node, field) is None or getattr(node, field).flags.owndata
         for node in trace.nodes
     )
 
 
-def test_bridged_turn_recovers_the_prior_turn_unforwarded_row():
+@pytest.mark.parametrize(
+    "field,dtype", [("routed_experts", "uint8"), ("indexer_topk", "int32")]
+)
+def test_bridged_turn_recovers_the_prior_turn_unforwarded_row(field, dtype):
     """A turn never forwards its own final sampled token, so the engine returns one routing row
     fewer than the turn has prompt plus completion positions, and that final position is filled
     with a copy of its predecessor: a placeholder, effectively. The next turn's prefill does
@@ -117,21 +135,20 @@ def test_bridged_turn_recovers_the_prior_turn_unforwarded_row():
                 prompt_ids=[10, 11, 12],
                 completion_ids=[20, 21],
                 message_spans=[(0, 2)],
-                routed_experts=_routed_payload(4, 0, 0),
+                **{field: _routed_payload(4, 0, 0, dtype=dtype)},
             ),
         )
     )
     sampled_node = trace.nodes[-1]
-    assert sampled_node.routed_experts is not None
+    rows = getattr(sampled_node, field)
+    assert rows is not None
     # First turn has the placeholder routing assignments:
-    assert bool(
-        (sampled_node.routed_experts[-1] == sampled_node.routed_experts[-2]).all()
-    )
-    forwarded_rows = sampled_node.routed_experts[:-1].copy()
+    assert bool((rows[-1] == rows[-2]).all())
+    forwarded_rows = rows[:-1].copy()
 
     # Start second turn
-    bridged = _routed_payload(4, 4, 100)
-    true_row = np.frombuffer(base64.b64decode(bridged["data"]), dtype=np.uint8).reshape(
+    bridged = _routed_payload(4, 4, 100, dtype=dtype)
+    true_row = np.frombuffer(base64.b64decode(bridged["data"]), dtype=dtype).reshape(
         bridged["shape"]
     )[0]
     graph.prepare_turn(
@@ -148,12 +165,12 @@ def test_bridged_turn_recovers_the_prior_turn_unforwarded_row():
                 prompt_ids=[10, 11, 12, 20, 21, 30, 31],
                 completion_ids=[40, 41],
                 message_spans=[(0, 2), None, (5, 7)],
-                routed_experts=bridged,
+                **{field: bridged},
             ),
         )
     )
 
-    recovered = sampled_node.routed_experts
+    recovered = getattr(sampled_node, field)
     assert recovered is not None
     # Did the first turn's final placeholder get corrected?
     assert bool((recovered[-1] == true_row).all()), (
@@ -165,8 +182,8 @@ def test_bridged_turn_recovers_the_prior_turn_unforwarded_row():
     )
     assert recovered.flags.owndata
     branch = trace.branches[-1]
-    assert branch.routed_experts is not None
-    assert branch.routed_experts.shape[0] == len(branch.token_ids)
+    assert getattr(branch, field) is not None
+    assert getattr(branch, field).shape[0] == len(branch.token_ids)
 
 
 def test_routed_experts_none_when_absent():

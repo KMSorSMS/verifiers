@@ -710,6 +710,15 @@ class Rollout:
         ):
             with contextlib.suppress(Exception):
                 await self.runtime.backend.stop()
+        self._raise_cleanup_error()
+
+    def _raise_cleanup_error(self) -> None:
+        error = self._session.cleanup_error
+        if error is not None:
+            if self._failure is not error:
+                self.fail(error)
+            self.trace.ok = False
+            raise error
 
     async def _score_harness(self, runtime: Runtime, deadline: float | None) -> None:
         """Collect best-effort metrics without replacing a task failure."""
@@ -733,7 +742,8 @@ class Rollout:
 
         Generation has already completed, so a teardown failure is logged rather than
         raised: it must not discard an otherwise scoreable (or already scored)
-        trajectory."""
+        trajectory. Unconfirmed inference cleanup remains latched on the session
+        and is raised after the remaining runtime teardown completes."""
         if self._harness_session is not None:
             try:
                 await self._harness_session.close()
@@ -798,8 +808,9 @@ class Rollout:
         session first, so an agent that may still be acting cannot change the box while
         it is graded. Isolated grading runs in its own box after the session closes.
         Harness metrics run after the close, which hands over the session's final state.
-        Idempotent; always returns the trace."""
+        Idempotent; returns the trace unless upstream inference could not be drained."""
         if self._closed:
+            self._raise_cleanup_error()
             return self.trace
         self._closed = True
         trace = self.trace
@@ -1027,6 +1038,7 @@ class Rollout:
                     exc_info=logger.isEnabledFor(logging.DEBUG),
                 )
             teardown = time.perf_counter() - started
+        self._raise_cleanup_error()
         timing = trace.timing
         spans = (
             ("boot", timing.boot),

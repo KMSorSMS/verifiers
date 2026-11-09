@@ -31,7 +31,13 @@ from verifiers.v1 import graph
 from verifiers.v1.clients import Client, ModelContext
 from verifiers.v1.configs.harness import DialectName
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
-from verifiers.v1.errors import HarnessError, RolloutError, TaskError
+from verifiers.v1.errors import (
+    HarnessError,
+    InferenceCleanupError,
+    RolloutError,
+    TaskError,
+    find_inference_cleanup_error,
+)
 from verifiers.v1.harnesses.utils.compaction import bound_tool_message
 from verifiers.v1.trace import InterceptRecord, Trace
 from verifiers.v1.types import (
@@ -43,6 +49,7 @@ from verifiers.v1.types import (
     ToolMessage,
     UserMessage,
 )
+from verifiers.v1.utils.aio import run_shielded
 from verifiers.v1.utils.decorators import invoke
 from verifiers.v1.utils.logging import (
     LogScope,
@@ -191,6 +198,9 @@ class RolloutSession:
     when its program dies on it the rollout records this original error instead of a secondary
     `HarnessError`. A harness that completes cleanly after the failure handled it. Reset before
     each model turn, so a successful retry clears it."""
+    cleanup_error: InferenceCleanupError | None = None
+    """Sticky failure to terminate upstream inference. Never cleared by a retry or
+    by sealing the trace; the run's owner must observe it at the drain boundary."""
     idempotent_requests: dict[str, IdempotentRequest] = field(default_factory=dict)
     """Explicit keys or marked SDK retries mapped to their replay state."""
     released: bool = False
@@ -620,12 +630,33 @@ class RolloutSession:
         for task in list(self.tasks):
             task.cancel()
 
+    async def drain(self) -> None:
+        """Wait for cancelled HTTP handlers, including their engine abort requests."""
+        tasks = [task for task in self.tasks if task is not asyncio.current_task()]
+
+        async def collect() -> None:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException) and (
+                    error := find_inference_cleanup_error(result)
+                ):
+                    self.cleanup_error = error
+
+        try:
+            await run_shielded(collect())
+        finally:
+            # A late error must survive release(), which intentionally seals the trace.
+            if self.cleanup_error is not None:
+                raise self.cleanup_error
+
     async def refused(self) -> str | None:
         """The framework's limits (turns / token budget) and `@stop` checks, run before each
         model call. Sets the stop condition and returns its name, else None. A refused first
         call halts the harness (its model call errors out); HarnessSession.turn treats it as clean. A task
         that ends a trajectory from `trace.state` does it with its own `@stop` (run here generically),
         so the interception server holds no opinion about the state's contents."""
+        if self.cleanup_error is not None:
+            raise self.cleanup_error
         if (limit := self.limits.reached(self.trace)) is not None:
             self.trace.stop(limit)
             logger.debug("Reached the %s limit", limit)

@@ -49,16 +49,25 @@ async def test_agent_retries_keep_the_trace_id(monkeypatch):
 
     monkeypatch.setattr(agent_module, "Rollout", FakeRollout)
     agent = vf.Agent(vf.AgentConfig(model="test-model", retries=RETRIES))
-    monkeypatch.setattr(agent, "_rollout_params", lambda *args: {})
+    seeds = []
+
+    def params(*args, sampling=None):
+        seeds.append(sampling.seed)
+        return {}
+
+    monkeypatch.setattr(agent, "_rollout_params", params)
 
     trace = await agent.run(
-        vf.Task(vf.TaskData(idx=0, prompt=None)), on_trace=minted.append
+        vf.Task(vf.TaskData(idx=0, prompt=None)),
+        on_trace=minted.append,
+        sampling=vf.SamplingConfig(seed=42),
     )
 
     assert [t.attempt for t in minted] == [1, 2, 3]
     assert {t.id for t in minted} == {trace.id}
     assert trace.attempt == 3
     assert [e.type for e in trace.errors] == ["SandboxError", "SandboxError"]
+    assert seeds == [42, 42, 42]
 
 
 @pytest.mark.asyncio

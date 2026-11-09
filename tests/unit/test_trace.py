@@ -25,6 +25,7 @@ class MyState(vf.State):
     score: int = 0
 
 
+@pytest.mark.parametrize("backend", ["vllm", "sglang"])
 @pytest.mark.parametrize(
     "sampling",
     [
@@ -40,8 +41,14 @@ class MyState(vf.State):
         {"extra_body": {"top_k": 20, "max_completion_tokens": None}},
     ],
 )
-def test_bare_trace_round_trip(sampling):
-    spec = vf.AgentConfig(sampling=sampling)
+def test_bare_trace_round_trip(sampling, backend):
+    spec = vf.AgentConfig(
+        sampling=sampling,
+        client=vf.TrainClientConfig(
+            backend=backend,
+            backend_options={"lora_path": "adapter-a"} if backend == "sglang" else {},
+        ),
+    )
     defaults = vf.SamplingConfig(temperature=0.7, max_tokens=128, top_k=40)
     # Resolve the live overrides before serializing the effective config on a trace.
     resolved = resolve_agent(spec, sampling=defaults)

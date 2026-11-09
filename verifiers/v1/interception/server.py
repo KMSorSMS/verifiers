@@ -55,6 +55,7 @@ from verifiers.v1.dialects.base import (
     is_sse_done_event,
 )
 from verifiers.v1.errors import (
+    InferenceCleanupError,
     ProviderError,
     RolloutError,
     TaskError,
@@ -436,6 +437,7 @@ class InterceptionServer(Interception):
             yield self.base_url, model_secret, state_secret
         finally:
             self.unregister(model_secret, state_secret)
+            await session.drain()
 
     @asynccontextmanager
     async def proxy_mcp(self, model_secret: str, url: str) -> AsyncIterator[str]:
@@ -1006,6 +1008,8 @@ class InterceptionServer(Interception):
                     # Relay the provider's status so the harness SDK retries 5xx/429 and not 4xx.
                     error = e
                     session.error = e
+                    if isinstance(e, InferenceCleanupError):
+                        session.cleanup_error = e
                     logger.warning(
                         "Model call failed - %s: %s", type(e).__name__, clip(str(e))
                     )

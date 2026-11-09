@@ -12,7 +12,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Generic, Literal, Self, cast
 from weakref import WeakValueDictionary
 
@@ -29,6 +29,7 @@ from verifiers.v1.configs.agent import (
     resolve_agent,
 )
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
+from verifiers.v1.configs.sampling import SamplingConfig
 from verifiers.v1.dialects import parse_message
 from verifiers.v1.harness import Harness
 from verifiers.v1.interception import Interception, InterceptionServer
@@ -675,6 +676,7 @@ class Agent:
         on_trace: Callable[[Trace], None] | None = None,
         collect_artifacts: bool = False,
         on_score: Callable[[Trace, Runtime], Awaitable[None]] | None = None,
+        sampling: SamplingConfig | None = None,
     ) -> Trace:
         """Run this agent on `task` once and return the trace: one segment — the
         program runs on the task's prompt until it exits (a multi-turn exchange
@@ -687,7 +689,9 @@ class Agent:
         (`config.retries`) — never into a borrowed box; every attempt's trace keeps
         the run's id with its own `attempt`, and the final trace keeps earlier
         attempts' errors. `on_score(trace, runtime)` runs after task scoring in
-        the selected verifier workspace, inside its timeout and retry boundary."""
+        the selected verifier workspace, inside its timeout and retry boundary.
+        `sampling` overrides this run only; concurrent runs never mutate the agent's
+        defaults, and retries retain the same effective sampling."""
         if self._closed:
             raise RuntimeError("Agent is closed; create a new agent")
         retry = self.config.retries
@@ -705,6 +709,7 @@ class Agent:
                     on_score,
                     trace_id=trace_id,
                     attempt=attempt + 1,
+                    sampling=sampling,
                 )
                 if attempt == retry_state.max_retries or trace.ok:
                     break
@@ -745,8 +750,11 @@ class Agent:
         *,
         trace_id: str,
         attempt: int,
+        sampling: SamplingConfig | None = None,
     ) -> Trace:
-        params = self._rollout_params(task, runtime, dict(shared_tools or {}))
+        params = self._rollout_params(
+            task, runtime, dict(shared_tools or {}), sampling=sampling
+        )
         if (
             collect_artifacts
             and not backend_cls(params["runtime_config"]).SUPPORTS_TASK_IMAGES
@@ -786,6 +794,7 @@ class Agent:
         runtime: Runtime | None = None,
         tools: Mapping[str, SharedToolServer] | None = None,
         on_trace: Callable[[Trace], None] | None = None,
+        sampling: SamplingConfig | None = None,
     ) -> AsyncIterator[Interaction]:
         """Interact with this agent turn-by-turn: a full rollout of `task` where
         the CALLER is the run's user — the one exchange surface. Yields an
@@ -817,7 +826,9 @@ class Agent:
         self._check_resume_support()
         trace_id = uuid.uuid4().hex
         with scope(trace=short_id(trace_id), agent=self._log_name):
-            params = self._rollout_params(task, runtime, dict(tools or {}))
+            params = self._rollout_params(
+                task, runtime, dict(tools or {}), sampling=sampling
+            )
             run = Rollout(
                 task=task,
                 has_user=True,
@@ -848,7 +859,12 @@ class Agent:
                     trace.agent.runtime.borrowed = runtime is not None
 
     def _rollout_params(
-        self, task: Task, runtime: Runtime | None, shared_tools: dict
+        self,
+        task: Task,
+        runtime: Runtime | None,
+        shared_tools: dict,
+        *,
+        sampling: SamplingConfig | None = None,
     ) -> dict:
         """Resolve one run's runtime config, pairing checks, timeouts,
         interception — shared by `run` and `interaction`."""
@@ -875,10 +891,24 @@ class Agent:
             tools=[*task.toolsets(task.config), *shared_tools.values()],
         )
         timeouts = resolve_rollout_timeouts(self.timeout, task)
+        config, ctx = self.config, self.ctx
+        if sampling is not None:
+            values = {
+                **ctx.sampling.model_dump(),
+                **sampling.model_dump(exclude_unset=True),
+            }
+            if config.max_turn_tokens is not None:
+                values["max_tokens"] = min(
+                    values.get("max_tokens") or config.max_turn_tokens,
+                    config.max_turn_tokens,
+                )
+            effective = SamplingConfig.model_validate(values)
+            config = config.model_copy(update={"sampling": effective})
+            ctx = replace(ctx, sampling=effective)
         return {
-            "agent_config": self.config,
+            "agent_config": config,
             "harness": harness,
-            "ctx": self.ctx,
+            "ctx": ctx,
             "runtime_config": runtime_config,
             "timeouts": timeouts,
             "limits": self.limits,
@@ -936,6 +966,23 @@ class _EpisodeAgent(Agent):
         self._on_trace = on_trace
         self._on_discard = on_discard
         self._log_name = name
+        self._run_index = 0
+
+    def _sampling_for_run(
+        self, sampling: SamplingConfig | None
+    ) -> SamplingConfig | None:
+        """Independent runs use reproducible distinct seeds when the episode pins one.
+        Allocate before awaiting the gate; retries reuse this run's resolved seed.
+        An explicit per-run seed (including None) takes precedence."""
+        index = self._run_index
+        self._run_index += 1
+        overrides = (
+            sampling.model_dump(exclude_unset=True) if sampling is not None else {}
+        )
+        seed = getattr(self.ctx.sampling, "seed", None)
+        if type(seed) is int and "seed" not in overrides:
+            return SamplingConfig.model_validate({**overrides, "seed": seed + index})
+        return sampling
 
     def _shared_for(self, task: Task) -> Mapping[str, SharedToolServer]:
         return self._shared_tools if isinstance(task, self._task_cls) else {}
@@ -1009,7 +1056,9 @@ class _EpisodeAgent(Agent):
         on_trace: Callable[[Trace], None] | None = None,
         collect_artifacts: bool = False,
         on_score: Callable[[Trace, Runtime], Awaitable[None]] | None = None,
+        sampling: SamplingConfig | None = None,
     ) -> Trace:
+        sampling = self._sampling_for_run(sampling)
         async with self._gate or nullcontext():
             trace = await super().run(
                 task,
@@ -1018,6 +1067,7 @@ class _EpisodeAgent(Agent):
                 on_trace=self._watch(on_trace),
                 collect_artifacts=collect_artifacts,
                 on_score=self._scoring_callback(on_score),
+                sampling=sampling,
             )
         self._completed.append(trace)
         return trace
@@ -1030,6 +1080,7 @@ class _EpisodeAgent(Agent):
         runtime: Runtime | None = None,
         tools: Mapping[str, SharedToolServer] | None = None,
         on_trace: Callable[[Trace], None] | None = None,
+        sampling: SamplingConfig | None = None,
     ) -> AsyncIterator[Interaction]:
         """The agent's `interaction`, with every trace stamped with its standing
         at mint and captured in `completed` at close — an interaction driven from
@@ -1038,6 +1089,7 @@ class _EpisodeAgent(Agent):
         its caller, so peer interactions still interleave where an episode plays one
         agent at a time."""
         trace: Trace | None = None
+        sampling = self._sampling_for_run(sampling)
 
         def remember(current: Trace) -> None:
             nonlocal trace
@@ -1051,6 +1103,7 @@ class _EpisodeAgent(Agent):
                 runtime=runtime,
                 tools=tools if tools is not None else self._shared_for(task),
                 on_trace=self._watch(remember),
+                sampling=sampling,
             ) as interaction:
                 yield interaction
         finally:

@@ -15,7 +15,8 @@ Four mechanisms, each in one place:
    the rollout re-raises it once the harness returns — not a secondary `HarnessError`.
 4. Capture (`Rollout`): the one place that records a failure (typed
    or not) onto the trace and never lets it cancel sibling rollouts. A bad rollout is data, not a
-   crash.
+   crash. The exception is `InferenceCleanupError`: unconfirmed termination of
+   upstream generation escapes the episode so a trainer cannot update live weights.
 
 The detail (status code, stderr, ...) comes from the wrapped inner error; we add a type only when
 the boundary isn't already clear from it.
@@ -40,6 +41,35 @@ class ProviderError(RolloutError):
     def __init__(self, message: str = "", *, status_code: int = 502) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+class InferenceCleanupError(ProviderError):
+    """The engine did not confirm termination of an abandoned generation.
+
+    This is a lifecycle failure, not a retryable rollout outcome: a training
+    controller must not update weights while the abandoned request may still run.
+    """
+
+    def __init__(self, message: str = "") -> None:
+        super().__init__(message, status_code=503)
+
+
+def find_inference_cleanup_error(error: BaseException) -> InferenceCleanupError | None:
+    """Find a cleanup failure through task groups and shielded cancellation causes."""
+    pending, seen = [error], set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, InferenceCleanupError):
+            return current
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        for cause in (current.__cause__, current.__context__):
+            if cause is not None:
+                pending.append(cause)
+    return None
 
 
 MODEL_TRANSPORT_ERROR_EXIT_CODE = 97

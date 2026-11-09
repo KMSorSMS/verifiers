@@ -1,4 +1,4 @@
-"""Train client: renders prompts to token ids and calls a vLLM generate endpoint."""
+"""Train client: renders prompts to token ids and calls a native generation backend."""
 
 import asyncio
 import json
@@ -19,7 +19,7 @@ from verifiers.v1.configs.client import TrainClientConfig
 from verifiers.v1.configs.sampling import SamplingConfig
 from verifiers.v1.dialects import FINISH_REASONS, ChatDialect, Dialect
 from verifiers.v1.dialects.chat import message_to_wire
-from verifiers.v1.errors import ProviderError, model_error
+from verifiers.v1.errors import InferenceCleanupError, ProviderError, model_error
 from verifiers.v1.graph import PendingTurn
 from verifiers.v1.types import (
     AssistantMessage,
@@ -190,11 +190,15 @@ def response_from_generate(
             mm_placeholders=mm_placeholders,
             mm_token_type_id_map=mm_token_type_id_map,
             routed_experts=result.get("routed_experts"),
+            indexer_topk=result.get("indexer_topk"),
             sampling_mask=SamplingMask.from_sampling_mask(mask)
             if (mask := result.get("sampling_mask"))
             else None,
             weight_versions=[WeightVersionSpan(**span) for span in spans]
             if (spans := result.get("weight_versions"))
+            else None,
+            prefill_weight_versions=[WeightVersionSpan(**span) for span in spans]
+            if (spans := result.get("prefill_weight_versions")) is not None
             else None,
             top_logprobs=(
                 TopLogprobs.from_top_logprobs(
@@ -337,7 +341,7 @@ class ElasticRendererPool:
 
 
 class TrainClient(Client):
-    """Renders prompts to token ids and calls a vLLM `/inference/v1/generate` engine.
+    """Renders prompts to token ids and calls a vLLM or SGLang engine.
 
     Owned by the interception server and shared by the rollouts it multiplexes: they reuse
     its engine connection pool, and each turn takes a slot on the shared
@@ -345,6 +349,18 @@ class TrainClient(Client):
 
     def __init__(self, config: TrainClientConfig) -> None:
         self.config = config
+        # Validate before opening connections. Backend imports are runtime-only: the
+        # configuration tree remains usable without model/HTTP dependencies.
+        if config.backend == "sglang":
+            from renderers.backends import SGLangOptions
+
+            self.backend_options = SGLangOptions.model_validate(
+                config.backend_options
+            ).model_dump(exclude_none=True)
+        else:
+            if config.backend_options:
+                raise ValueError("vLLM does not accept backend_options")
+            self.backend_options = {}
         self.client = build_async_openai(config)
         # The per-request model is only known at call time; a config that pins the renderer
         # model can warm now, which is every training run (prime-rl always pins it).
@@ -384,7 +400,12 @@ class TrainClient(Client):
             request = dialect.parse_request(body)
             prompt = request.messages
             tools = request.tools
-        from renderers.client import generate
+        from renderers.client import (
+            EngineAbortedError,
+            EngineAbortError,
+            MalformedGenerateResponseError,
+            generate,
+        )
 
         wire_tools = [tool_to_wire(t) for t in tools] if tools else None
         wire_messages = [message_to_wire(m) for m in prompt]
@@ -415,8 +436,8 @@ class TrainClient(Client):
                 renderer.mm_token_type_id_map if is_multimodal(renderer) else None
             )
             has_images = _has_multimodal_content(prompt)
-            process_multimodal = not has_images
-            if has_images and not getattr(
+            process_multimodal = self.config.backend == "sglang" or not has_images
+            if not process_multimodal and not getattr(
                 renderer, "supports_process_multimodal", False
             ):
                 raise NotImplementedError(
@@ -424,7 +445,14 @@ class TrainClient(Client):
                 )
             render_kwargs = {} if process_multimodal else {"process_multimodal": False}
             # Only build the O(context) previous token stream for a bridgeable tail.
-            can_bridge = turn is not None and _is_valid_incremental_tail(wire_tail)
+            can_bridge = (
+                turn is not None
+                and _is_valid_incremental_tail(wire_tail)
+                # SGLang needs expanded image tokens and their matching sidecar.
+                # A full render reconstructs both; the graph still records the exact
+                # sampled sequence, including a new branch if the prefix changes.
+                and not (self.config.backend == "sglang" and has_images)
+            )
             previous_ids = turn.previous_renderer_token_ids() if can_bridge else None
             if previous_ids is not None:
                 previous_prompt_ids, previous_completion_ids = previous_ids
@@ -473,7 +501,13 @@ class TrainClient(Client):
                     tools=wire_tools,
                     sampling_params=sampling_params,
                     process_multimodal=process_multimodal,
+                    multi_modal_data=prompt_attribution.multi_modal_data
+                    if prompt_attribution is not None
+                    else None,
                     cache_salt=cache_salt,
+                    backend=self.config.backend,
+                    backend_options=self.backend_options,
+                    is_initial_turn=turn is None or turn.trace.num_turns == 0,
                     extra_headers={SESSION_ID_HEADER: session_id}
                     if session_id
                     else None,
@@ -484,6 +518,12 @@ class TrainClient(Client):
                 raise ProviderError(str(e), status_code=400) from e
             except OpenAIError as e:
                 raise model_error(e) from e
+            except EngineAbortError as e:
+                raise InferenceCleanupError(str(e)) from e
+            except EngineAbortedError as e:
+                raise ProviderError(str(e), status_code=503) from e
+            except MalformedGenerateResponseError as e:
+                raise ProviderError(str(e), status_code=502) from e
         response = response_from_generate(
             result, model, bridged_turn, mm_token_type_id_map
         )
